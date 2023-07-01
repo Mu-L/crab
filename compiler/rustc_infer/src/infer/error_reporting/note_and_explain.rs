@@ -139,7 +139,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                                     tcx,
                                     generics,
                                     diag,
-                                    &format!("{}", proj.self_ty()),
+                                    &proj.self_ty().to_string(),
                                     &path,
                                     None,
                                     matching_span,
@@ -153,7 +153,7 @@ impl<'tcx> TypeErrCtxt<'_, 'tcx> {
                                     tcx,
                                     generics,
                                     diag,
-                                    &format!("{}", proj.self_ty()),
+                                    &proj.self_ty().to_string(),
                                     &path,
                                     None,
                                     matching_span,
@@ -260,7 +260,8 @@ impl<T> Trait<T> for X {
                     (ty::Alias(ty::Opaque, alias), _) | (_, ty::Alias(ty::Opaque, alias)) if alias.def_id.is_local() && matches!(tcx.def_kind(body_owner_def_id), DefKind::AssocFn | DefKind::AssocConst) => {
                         if tcx.is_type_alias_impl_trait(alias.def_id) {
                             if !tcx.opaque_types_defined_by(body_owner_def_id.expect_local()).contains(&alias.def_id.expect_local()) {
-                                diag.span_note(tcx.def_span(body_owner_def_id), "\
+                                let sp = tcx.def_ident_span(body_owner_def_id).unwrap_or_else(|| tcx.def_span(body_owner_def_id));
+                                diag.span_note(sp, "\
                                     this item must have the opaque type in its signature \
                                     in order to be able to register hidden types");
                             }
@@ -374,12 +375,18 @@ impl<T> Trait<T> for X {
     ) {
         let tcx = self.tcx;
 
+        // Don't suggest constraining a projection to something containing itself
+        if self.tcx.erase_regions(values.found).contains(self.tcx.erase_regions(values.expected)) {
+            return;
+        }
+
         let msg = || {
             format!(
                 "consider constraining the associated type `{}` to `{}`",
                 values.expected, values.found
             )
         };
+
         let body_owner = tcx.hir().get_if_local(body_owner_def_id);
         let current_method_ident = body_owner.and_then(|n| n.ident()).map(|i| i.name);
 

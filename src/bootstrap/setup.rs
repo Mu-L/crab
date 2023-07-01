@@ -87,7 +87,7 @@ impl FromStr for Profile {
             "lib" | "library" => Ok(Profile::Library),
             "compiler" => Ok(Profile::Compiler),
             "llvm" | "codegen" => Ok(Profile::Codegen),
-            "maintainer" | "dist" => Ok(Profile::Dist),
+            "maintainer" | "dist" | "user" => Ok(Profile::Dist),
             "tools" | "tool" | "rustdoc" | "clippy" | "miri" | "rustfmt" | "rls" => {
                 Ok(Profile::Tools)
             }
@@ -174,6 +174,14 @@ pub fn setup(config: &Config, profile: Profile) {
         println!(
             "For more suggestions, see https://rustc-dev-guide.rust-lang.org/building/suggested.html"
         );
+    }
+
+    if profile == Profile::Tools {
+        eprintln!();
+        eprintln!(
+            "note: the `tools` profile sets up the `stage2` toolchain (use \
+            `rustup toolchain link 'name' host/build/stage2` to use rustc)"
+        )
     }
 
     let path = &config.config.clone().unwrap_or(PathBuf::from("config.toml"));
@@ -574,7 +582,7 @@ fn create_vscode_settings_maybe(config: &Config) -> io::Result<()> {
             Some(false) => {
                 // exists and is not current version or outdated, so back it up
                 let mut backup = vscode_settings.clone();
-                backup.set_extension("bak");
+                backup.set_extension("json.bak");
                 eprintln!("warning: copying `settings.json` to `settings.json.bak`");
                 fs::copy(&vscode_settings, &backup)?;
                 "Updated"

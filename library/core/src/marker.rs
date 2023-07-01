@@ -140,7 +140,8 @@ unsafe impl<T: Sync + ?Sized> Send for &T {}
 )]
 #[fundamental] // for Default, for example, which requires that `[T]: !Default` be evaluatable
 #[rustc_specialization_trait]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 #[rustc_coinductive]
 pub trait Sized {
     // Empty.
@@ -173,7 +174,8 @@ pub trait Sized {
 /// [nomicon-coerce]: ../../nomicon/coercions.html
 #[unstable(feature = "unsize", issue = "18598")]
 #[lang = "unsize"]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait Unsize<T: ?Sized> {
     // Empty.
 }
@@ -573,59 +575,59 @@ impl<T: ?Sized> Copy for &T {}
 #[lang = "sync"]
 #[rustc_on_unimplemented(
     on(
-        _Self = "std::cell::OnceCell<T>",
+        any(_Self = "core::cell:OnceCell<T>", _Self = "std::cell::OnceCell<T>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::OnceLock` instead"
     ),
     on(
-        _Self = "std::cell::Cell<u8>",
+        any(_Self = "core::cell::Cell<u8>", _Self = "std::cell::Cell<u8>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU8` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u16>",
+        any(_Self = "core::cell::Cell<u16>", _Self = "std::cell::Cell<u16>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU16` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u32>",
+        any(_Self = "core::cell::Cell<u32>", _Self = "std::cell::Cell<u32>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU32` instead",
     ),
     on(
-        _Self = "std::cell::Cell<u64>",
+        any(_Self = "core::cell::Cell<u64>", _Self = "std::cell::Cell<u64>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicU64` instead",
     ),
     on(
-        _Self = "std::cell::Cell<usize>",
+        any(_Self = "core::cell::Cell<usize>", _Self = "std::cell::Cell<usize>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicUsize` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i8>",
+        any(_Self = "core::cell::Cell<i8>", _Self = "std::cell::Cell<i8>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI8` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i16>",
+        any(_Self = "core::cell::Cell<i16>", _Self = "std::cell::Cell<i16>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI16` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i32>",
+        any(_Self = "core::cell::Cell<i32>", _Self = "std::cell::Cell<i32>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI32` instead",
     ),
     on(
-        _Self = "std::cell::Cell<i64>",
+        any(_Self = "core::cell::Cell<i64>", _Self = "std::cell::Cell<i64>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicI64` instead",
     ),
     on(
-        _Self = "std::cell::Cell<isize>",
+        any(_Self = "core::cell::Cell<isize>", _Self = "std::cell::Cell<isize>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicIsize` instead",
     ),
     on(
-        _Self = "std::cell::Cell<bool>",
+        any(_Self = "core::cell::Cell<bool>", _Self = "std::cell::Cell<bool>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` or `std::sync::atomic::AtomicBool` instead",
     ),
     on(
-        _Self = "std::cell::Cell<T>",
+        any(_Self = "core::cell::Cell<T>", _Self = "std::cell::Cell<T>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock`",
     ),
     on(
-        _Self = "std::cell::RefCell<T>",
+        any(_Self = "core::cell::RefCell<T>", _Self = "std::cell::RefCell<T>"),
         note = "if you want to do aliasing and mutation between multiple threads, use `std::sync::RwLock` instead",
     ),
     message = "`{Self}` cannot be shared between threads safely",
@@ -854,7 +856,8 @@ impl<T: ?Sized> StructuralEq for PhantomData<T> {}
     reason = "this trait is unlikely to ever be stabilized, use `mem::discriminant` instead"
 )]
 #[lang = "discriminant_kind"]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait DiscriminantKind {
     /// The type of the discriminant, which must satisfy the trait
     /// bounds required by `mem::Discriminant`.
@@ -959,7 +962,8 @@ marker_impls! {
 #[unstable(feature = "const_trait_impl", issue = "67792")]
 #[lang = "destruct"]
 #[rustc_on_unimplemented(message = "can't drop `{Self}`", append_const_msg)]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 #[const_trait]
 pub trait Destruct {}
 
@@ -970,7 +974,8 @@ pub trait Destruct {}
 #[unstable(feature = "tuple_trait", issue = "none")]
 #[lang = "tuple_trait"]
 #[rustc_on_unimplemented(message = "`{Self}` is not a tuple")]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait Tuple {}
 
 /// A marker for pointer-like types.
@@ -1025,7 +1030,8 @@ impl ConstParamTy for () {}
     reason = "internal trait for implementing various traits for all function pointers"
 )]
 #[lang = "fn_ptr_trait"]
-#[rustc_deny_explicit_impl]
+#[cfg_attr(not(bootstrap), rustc_deny_explicit_impl(implement_via_object = false))]
+#[cfg_attr(bootstrap, rustc_deny_explicit_impl)]
 pub trait FnPtr: Copy + Clone {
     /// Returns the address of the function pointer.
     #[lang = "fn_ptr_addr"]

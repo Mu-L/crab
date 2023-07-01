@@ -10,7 +10,7 @@ use rustc_ast::{
     self as ast, AssocItemKind, Expr, ExprKind, GenericParam, GenericParamKind, Item, ItemKind,
     MethodCall, NodeId, Path, Ty, TyKind, DUMMY_NODE_ID,
 };
-use rustc_ast_pretty::pprust::path_segment_to_string;
+use rustc_ast_pretty::pprust::where_bound_predicate_to_string;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::{
     pluralize, struct_span_err, Applicability, Diagnostic, DiagnosticBuilder, ErrorGuaranteed,
@@ -149,6 +149,7 @@ struct BaseError {
     span_label: Option<(Span, &'static str)>,
     could_be_expr: bool,
     suggestion: Option<(Span, &'static str, String)>,
+    module: Option<DefId>,
 }
 
 #[derive(Debug)]
@@ -210,10 +211,11 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                     _ => false,
                 },
                 suggestion: None,
+                module: None,
             }
         } else {
             let item_span = path.last().unwrap().ident.span;
-            let (mod_prefix, mod_str, suggestion) = if path.len() == 1 {
+            let (mod_prefix, mod_str, module, suggestion) = if path.len() == 1 {
                 debug!(?self.diagnostic_metadata.current_impl_items);
                 debug!(?self.diagnostic_metadata.current_function);
                 let suggestion = if self.current_trait_ref.is_none()
@@ -247,26 +249,37 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 } else {
                     None
                 };
-                (String::new(), "this scope".to_string(), suggestion)
+                (String::new(), "this scope".to_string(), None, suggestion)
             } else if path.len() == 2 && path[0].ident.name == kw::PathRoot {
                 if self.r.tcx.sess.edition() > Edition::Edition2015 {
                     // In edition 2018 onwards, the `::foo` syntax may only pull from the extern prelude
                     // which overrides all other expectations of item type
                     expected = "crate";
-                    (String::new(), "the list of imported crates".to_string(), None)
+                    (String::new(), "the list of imported crates".to_string(), None, None)
                 } else {
-                    (String::new(), "the crate root".to_string(), None)
+                    (
+                        String::new(),
+                        "the crate root".to_string(),
+                        Some(CRATE_DEF_ID.to_def_id()),
+                        None,
+                    )
                 }
             } else if path.len() == 2 && path[0].ident.name == kw::Crate {
-                (String::new(), "the crate root".to_string(), None)
+                (String::new(), "the crate root".to_string(), Some(CRATE_DEF_ID.to_def_id()), None)
             } else {
                 let mod_path = &path[..path.len() - 1];
-                let mod_prefix = match self.resolve_path(mod_path, Some(TypeNS), None) {
+                let mod_res = self.resolve_path(mod_path, Some(TypeNS), None);
+                let mod_prefix = match mod_res {
                     PathResult::Module(ModuleOrUniformRoot::Module(module)) => module.res(),
                     _ => None,
-                }
-                .map_or_else(String::new, |res| format!("{} ", res.descr()));
-                (mod_prefix, format!("`{}`", Segment::names_to_string(mod_path)), None)
+                };
+
+                let module_did = mod_prefix.as_ref().and_then(Res::mod_def_id);
+
+                let mod_prefix =
+                    mod_prefix.map_or_else(String::new, |res| (format!("{} ", res.descr())));
+
+                (mod_prefix, format!("`{}`", Segment::names_to_string(mod_path)), module_did, None)
             };
 
             let (fallback_label, suggestion) = if path_str == "async"
@@ -300,6 +313,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 span_label: None,
                 could_be_expr: false,
                 suggestion,
+                module,
             }
         }
     }
@@ -315,6 +329,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
     ) -> (DiagnosticBuilder<'tcx, ErrorGuaranteed>, Vec<ImportSuggestion>) {
         debug!(?res, ?source);
         let base_error = self.make_base_error(path, span, source, res);
+
         let code = source.error_code(res.is_some());
         let mut err = self.r.tcx.sess.struct_span_err_with_code(
             base_error.span,
@@ -365,6 +380,10 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
             err.span_label(base_error.span, base_error.fallback_label);
         }
         self.err_code_special_cases(&mut err, source, path, span);
+
+        if let Some(module) = base_error.module {
+            self.r.find_cfg_stripped(&mut err, &path.last().unwrap().ident.name, module);
+        }
 
         (err, candidates)
     }
@@ -477,7 +496,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
         // Try to filter out intrinsics candidates, as long as we have
         // some other candidates to suggest.
         let intrinsic_candidates: Vec<_> = candidates
-            .drain_filter(|sugg| {
+            .extract_if(|sugg| {
                 let path = path_names_to_string(&sugg.path);
                 path.starts_with("core::intrinsics::") || path.starts_with("std::intrinsics::")
             })
@@ -1031,7 +1050,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
             };
 
         // Confirm that the target is an associated type.
-        let (ty, position, path) = if let ast::TyKind::Path(Some(qself), path) = &bounded_ty.kind {
+        let (ty, _, path) = if let ast::TyKind::Path(Some(qself), path) = &bounded_ty.kind {
             // use this to verify that ident is a type param.
             let Some(partial_res) = self.r.partial_res_map.get(&bounded_ty.id) else {
                 return false;
@@ -1060,7 +1079,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 return false;
             }
             if let (
-                [ast::PathSegment { ident: constrain_ident, args: None, .. }],
+                [ast::PathSegment { args: None, .. }],
                 [ast::GenericBound::Trait(poly_trait_ref, ast::TraitBoundModifier::None)],
             ) = (&type_param_path.segments[..], &bounds[..])
             {
@@ -1068,29 +1087,11 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                     &poly_trait_ref.trait_ref.path.segments[..]
                 {
                     if ident.span == span {
+                        let Some(new_where_bound_predicate) = mk_where_bound_predicate(path, poly_trait_ref, ty) else { return false; };
                         err.span_suggestion_verbose(
                             *where_span,
                             format!("constrain the associated type to `{}`", ident),
-                            format!(
-                                "{}: {}<{} = {}>",
-                                self.r
-                                    .tcx
-                                    .sess
-                                    .source_map()
-                                    .span_to_snippet(ty.span) // Account for `<&'a T as Foo>::Bar`.
-                                    .unwrap_or_else(|_| constrain_ident.to_string()),
-                                path.segments[..position]
-                                    .iter()
-                                    .map(|segment| path_segment_to_string(segment))
-                                    .collect::<Vec<_>>()
-                                    .join("::"),
-                                path.segments[position..]
-                                    .iter()
-                                    .map(|segment| path_segment_to_string(segment))
-                                    .collect::<Vec<_>>()
-                                    .join("::"),
-                                ident,
-                            ),
+                            where_bound_predicate_to_string(&new_where_bound_predicate),
                             Applicability::MaybeIncorrect,
                         );
                     }
@@ -1830,6 +1831,7 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                                 path,
                                 accessible: true,
                                 note: None,
+                                via_import: false,
                             },
                         ));
                     } else {
@@ -2181,10 +2183,9 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
                 None => {
                     debug!(?param.ident, ?param.ident.span);
                     let deletion_span = deletion_span();
-                    // the give lifetime originates from expanded code so we won't be able to remove it #104432
-                    let lifetime_only_in_expanded_code =
-                        deletion_span.map(|sp| sp.in_derive_expansion()).unwrap_or(true);
-                    if !lifetime_only_in_expanded_code {
+
+                    // if the lifetime originates from expanded code, we won't be able to remove it #104432
+                    if deletion_span.is_some_and(|sp| !sp.in_derive_expansion()) {
                         self.r.lint_buffer.buffer_lint_with_diagnostic(
                             lint::builtin::UNUSED_LIFETIMES,
                             param.id,
@@ -2584,6 +2585,70 @@ impl<'a: 'ast, 'ast, 'tcx> LateResolutionVisitor<'a, '_, 'ast, 'tcx> {
             }
         }
     }
+}
+
+fn mk_where_bound_predicate(
+    path: &Path,
+    poly_trait_ref: &ast::PolyTraitRef,
+    ty: &ast::Ty,
+) -> Option<ast::WhereBoundPredicate> {
+    use rustc_span::DUMMY_SP;
+    let modified_segments = {
+        let mut segments = path.segments.clone();
+        let [preceding @ .., second_last, last] = segments.as_mut_slice() else { return None; };
+        let mut segments = ThinVec::from(preceding);
+
+        let added_constraint = ast::AngleBracketedArg::Constraint(ast::AssocConstraint {
+            id: DUMMY_NODE_ID,
+            ident: last.ident,
+            gen_args: None,
+            kind: ast::AssocConstraintKind::Equality {
+                term: ast::Term::Ty(ast::ptr::P(ast::Ty {
+                    kind: ast::TyKind::Path(None, poly_trait_ref.trait_ref.path.clone()),
+                    id: DUMMY_NODE_ID,
+                    span: DUMMY_SP,
+                    tokens: None,
+                })),
+            },
+            span: DUMMY_SP,
+        });
+
+        match second_last.args.as_deref_mut() {
+            Some(ast::GenericArgs::AngleBracketed(ast::AngleBracketedArgs { args, .. })) => {
+                args.push(added_constraint);
+            }
+            Some(_) => return None,
+            None => {
+                second_last.args =
+                    Some(ast::ptr::P(ast::GenericArgs::AngleBracketed(ast::AngleBracketedArgs {
+                        args: ThinVec::from([added_constraint]),
+                        span: DUMMY_SP,
+                    })));
+            }
+        }
+
+        segments.push(second_last.clone());
+        segments
+    };
+
+    let new_where_bound_predicate = ast::WhereBoundPredicate {
+        span: DUMMY_SP,
+        bound_generic_params: ThinVec::new(),
+        bounded_ty: ast::ptr::P(ty.clone()),
+        bounds: vec![ast::GenericBound::Trait(
+            ast::PolyTraitRef {
+                bound_generic_params: ThinVec::new(),
+                trait_ref: ast::TraitRef {
+                    path: ast::Path { segments: modified_segments, span: DUMMY_SP, tokens: None },
+                    ref_id: DUMMY_NODE_ID,
+                },
+                span: DUMMY_SP,
+            },
+            ast::TraitBoundModifier::None,
+        )],
+    };
+
+    Some(new_where_bound_predicate)
 }
 
 /// Report lifetime/lifetime shadowing as an error.

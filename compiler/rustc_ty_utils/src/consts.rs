@@ -78,8 +78,9 @@ pub(crate) fn destructure_const<'tcx>(
 fn check_binop(op: mir::BinOp) -> bool {
     use mir::BinOp::*;
     match op {
-        Add | Sub | Mul | Div | Rem | BitXor | BitAnd | BitOr | Shl | Shr | Eq | Lt | Le | Ne
-        | Ge | Gt => true,
+        Add | AddUnchecked | Sub | SubUnchecked | Mul | MulUnchecked | Div | Rem | BitXor
+        | BitAnd | BitOr | Shl | ShlUnchecked | Shr | ShrUnchecked | Eq | Lt | Le | Ne | Ge
+        | Gt => true,
         Offset => false,
     }
 }
@@ -240,7 +241,8 @@ fn recurse_build<'tcx>(
         ExprKind::Assign { .. } | ExprKind::AssignOp { .. } => {
             error(GenericConstantTooComplexSub::AssignNotSupported(node.span))?
         }
-        ExprKind::Closure { .. } | ExprKind::Return { .. } => {
+        // FIXME(explicit_tail_calls): maybe get `become` a new error
+        ExprKind::Closure { .. } | ExprKind::Return { .. } | ExprKind::Become { .. } => {
             error(GenericConstantTooComplexSub::ClosureAndReturnNotSupported(node.span))?
         }
         // let expressions imply control flow
@@ -336,6 +338,7 @@ impl<'a, 'tcx> IsThirPolymorphic<'a, 'tcx> {
             | thir::ExprKind::Break { .. }
             | thir::ExprKind::Continue { .. }
             | thir::ExprKind::Return { .. }
+            | thir::ExprKind::Become { .. }
             | thir::ExprKind::Array { .. }
             | thir::ExprKind::Tuple { .. }
             | thir::ExprKind::Adt(_)

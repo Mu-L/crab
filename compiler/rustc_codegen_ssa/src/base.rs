@@ -13,7 +13,7 @@ use crate::mir::place::PlaceRef;
 use crate::traits::*;
 use crate::{CachedModuleCodegen, CompiledModule, CrateInfo, MemFlags, ModuleCodegen, ModuleKind};
 
-use rustc_ast::expand::allocator::AllocatorKind;
+use rustc_ast::expand::allocator::{global_fn_name, AllocatorKind, ALLOCATOR_METHODS};
 use rustc_attr as attr;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_data_structures::profiling::{get_resident_set_size, print_time_passes_entry};
@@ -357,6 +357,13 @@ pub fn cast_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
     }
 }
 
+// Returns `true` if this session's target will use native wasm
+// exceptions. This means that the VM does the unwinding for
+// us
+pub fn wants_wasm_eh(sess: &Session) -> bool {
+    sess.target.is_like_wasm && sess.target.os != "emscripten"
+}
+
 /// Returns `true` if this session's target will use SEH-based unwinding.
 ///
 /// This is only true for MSVC targets, and even then the 64-bit MSVC target
@@ -364,6 +371,13 @@ pub fn cast_shift_expr_rhs<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
 /// 64-bit MinGW) instead of "full SEH".
 pub fn wants_msvc_seh(sess: &Session) -> bool {
     sess.target.is_like_msvc
+}
+
+/// Returns `true` if this session's target requires the new exception
+/// handling LLVM IR instructions (catchpad / cleanuppad / ... instead
+/// of landingpad)
+pub fn wants_new_eh_instructions(sess: &Session) -> bool {
+    wants_wasm_eh(sess) || wants_msvc_seh(sess)
 }
 
 pub fn memcpy_ty<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
@@ -380,7 +394,19 @@ pub fn memcpy_ty<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>>(
         return;
     }
 
-    bx.memcpy(dst, dst_align, src, src_align, bx.cx().const_usize(size), flags);
+    if flags == MemFlags::empty()
+        && let Some(bty) = bx.cx().scalar_copy_backend_type(layout)
+    {
+        // I look forward to only supporting opaque pointers
+        let pty = bx.type_ptr_to(bty);
+        let src = bx.pointercast(src, pty);
+        let dst = bx.pointercast(dst, pty);
+
+        let temp = bx.load(bty, src, src_align);
+        bx.store(temp, dst, dst_align);
+    } else {
+        bx.memcpy(dst, dst_align, src, src_align, bx.cx().const_usize(size), flags);
+    }
 }
 
 pub fn codegen_instance<'a, 'tcx: 'a, Bx: BuilderMethods<'a, 'tcx>>(
@@ -568,7 +594,7 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
 ) -> OngoingCodegen<B> {
     // Skip crate items and just output metadata in -Z no-codegen mode.
     if tcx.sess.opts.unstable_opts.no_codegen || !tcx.sess.opts.output_types.should_codegen() {
-        let ongoing_codegen = start_async_codegen(backend, tcx, target_cpu, metadata, None, 1);
+        let ongoing_codegen = start_async_codegen(backend, tcx, target_cpu, metadata, None);
 
         ongoing_codegen.codegen_finished(tcx);
 
@@ -619,14 +645,8 @@ pub fn codegen_crate<B: ExtraBackendMethods>(
         })
     });
 
-    let ongoing_codegen = start_async_codegen(
-        backend.clone(),
-        tcx,
-        target_cpu,
-        metadata,
-        metadata_module,
-        codegen_units.len(),
-    );
+    let ongoing_codegen =
+        start_async_codegen(backend.clone(), tcx, target_cpu, metadata, metadata_module);
 
     // Codegen an allocator shim, if necessary.
     if let Some(kind) = allocator_kind_for_codegen(tcx) {
@@ -909,7 +929,21 @@ impl CrateInfo {
                         missing_weak_lang_items
                             .iter()
                             .map(|item| (format!("{prefix}{item}"), SymbolExportKind::Text)),
-                    )
+                    );
+                    if tcx.allocator_kind(()).is_some() {
+                        // At least one crate needs a global allocator. This crate may be placed
+                        // after the crate that defines it in the linker order, in which case some
+                        // linkers return an error. By adding the global allocator shim methods to
+                        // the linked_symbols list, linking the generated symbols.o will ensure that
+                        // circular dependencies involving the global allocator don't lead to linker
+                        // errors.
+                        linked_symbols.extend(ALLOCATOR_METHODS.iter().map(|method| {
+                            (
+                                format!("{prefix}{}", global_fn_name(method.name).as_str()),
+                                SymbolExportKind::Text,
+                            )
+                        }));
+                    }
                 });
         }
 

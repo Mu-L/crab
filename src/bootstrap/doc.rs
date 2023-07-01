@@ -8,7 +8,6 @@
 //! `rustdoc`.
 
 use std::fs;
-use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::builder::crate_description;
@@ -223,7 +222,7 @@ impl Step for TheBook {
         let shared_assets = builder.ensure(SharedAssets { target });
 
         // build the redirect pages
-        builder.info(&format!("Documenting book redirect pages ({})", target));
+        builder.msg_doc(compiler, "book redirect pages", target);
         for file in t!(fs::read_dir(builder.src.join(&relative_path).join("redirects"))) {
             let file = t!(file);
             let path = file.path();
@@ -307,7 +306,7 @@ impl Step for Standalone {
     fn run(self, builder: &Builder<'_>) {
         let target = self.target;
         let compiler = self.compiler;
-        builder.info(&format!("Documenting standalone ({})", target));
+        builder.msg_doc(compiler, "standalone", target);
         let out = builder.doc_out(target);
         t!(fs::create_dir_all(&out));
 
@@ -563,7 +562,7 @@ fn doc_std(
 
     let description =
         format!("library{} in {} format", crate_description(&requested_crates), format.as_str());
-    let _guard = builder.msg(Kind::Doc, stage, &description, compiler.host, target);
+    let _guard = builder.msg_doc(compiler, &description, target);
 
     let target_doc_dir_name = if format == DocumentationFormat::JSON { "json-doc" } else { "doc" };
     let target_dir =
@@ -667,7 +666,7 @@ impl Step for Rustc {
     /// Compiler documentation is distributed separately, so we make sure
     /// we do not merge it with the other documentation from std, test and
     /// proc_macros. This is largely just a wrapper around `cargo doc`.
-    fn run(self, builder: &Builder<'_>) {
+    fn run(mut self, builder: &Builder<'_>) {
         let stage = self.stage;
         let target = self.target;
 
@@ -694,11 +693,12 @@ impl Step for Rustc {
         // rustc. rustdoc needs to be able to see everything, for example when
         // merging the search index, or generating local (relative) links.
         let out_dir = builder.stage_out(compiler, Mode::Rustc).join(target.triple).join("doc");
-        t!(symlink_dir_force(&builder.config, &out, &out_dir));
+        t!(fs::create_dir_all(out_dir.parent().unwrap()));
+        symlink_dir_force(&builder.config, &out, &out_dir);
         // Cargo puts proc macros in `target/doc` even if you pass `--target`
         // explicitly (https://github.com/rust-lang/cargo/issues/7677).
         let proc_macro_out_dir = builder.stage_out(compiler, Mode::Rustc).join("doc");
-        t!(symlink_dir_force(&builder.config, &out, &proc_macro_out_dir));
+        symlink_dir_force(&builder.config, &out, &proc_macro_out_dir);
 
         // Build cargo command.
         let mut cargo = builder.cargo(compiler, Mode::Rustc, SourceType::InTree, target, "doc");
@@ -725,6 +725,11 @@ impl Step for Rustc {
         cargo.rustdocflag("ena=https://docs.rs/ena/latest/");
 
         let mut to_open = None;
+
+        if self.crates.is_empty() {
+            self.crates = INTERNER.intern_list(vec!["rustc_driver".to_owned()]);
+        };
+
         for krate in &*self.crates {
             // Create all crate output directories first to make sure rustdoc uses
             // relative links.
@@ -746,7 +751,15 @@ impl Step for Rustc {
 }
 
 macro_rules! tool_doc {
-    ($tool: ident, $should_run: literal, $path: literal, $(rustc_tool = $rustc_tool:literal, )? $(in_tree = $in_tree:literal, )? [$($krate: literal),+ $(,)?] $(,)?) => {
+    (
+        $tool: ident,
+        $should_run: literal,
+        $path: literal,
+        $(rustc_tool = $rustc_tool:literal, )?
+        $(in_tree = $in_tree:literal, )?
+        [$($extra_arg: literal),+ $(,)?]
+        $(,)?
+    ) => {
         #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
         pub struct $tool {
             target: TargetSelection,
@@ -799,14 +812,7 @@ macro_rules! tool_doc {
                     SourceType::Submodule
                 };
 
-                builder.info(
-                    &format!(
-                        "Documenting stage{} {} ({})",
-                        stage,
-                        stringify!($tool).to_lowercase(),
-                        target,
-                    ),
-                );
+                builder.msg_doc(compiler, stringify!($tool).to_lowercase(), target);
 
                 // Symlink compiler docs to the output directory of rustdoc documentation.
                 let out_dirs = [
@@ -816,7 +822,7 @@ macro_rules! tool_doc {
                 ];
                 for out_dir in out_dirs {
                     t!(fs::create_dir_all(&out_dir));
-                    t!(symlink_dir_force(&builder.config, &out, &out_dir));
+                    symlink_dir_force(&builder.config, &out, &out_dir);
                 }
 
                 // Build cargo command.
@@ -834,9 +840,9 @@ macro_rules! tool_doc {
                 cargo.arg("-Zskip-rustdoc-fingerprint");
                 // Only include compiler crates, no dependencies of those, such as `libc`.
                 cargo.arg("--no-deps");
-                cargo.arg("--lib");
+
                 $(
-                    cargo.arg("-p").arg($krate);
+                    cargo.arg($extra_arg);
                 )+
 
                 cargo.rustdocflag("--document-private-items");
@@ -852,15 +858,20 @@ macro_rules! tool_doc {
     }
 }
 
-tool_doc!(Rustdoc, "rustdoc-tool", "src/tools/rustdoc", ["rustdoc", "rustdoc-json-types"],);
+tool_doc!(
+    Rustdoc,
+    "rustdoc-tool",
+    "src/tools/rustdoc",
+    ["-p", "rustdoc", "-p", "rustdoc-json-types"]
+);
 tool_doc!(
     Rustfmt,
     "rustfmt-nightly",
     "src/tools/rustfmt",
-    ["rustfmt-nightly", "rustfmt-config_proc_macro"],
+    ["-p", "rustfmt-nightly", "-p", "rustfmt-config_proc_macro"],
 );
-tool_doc!(Clippy, "clippy", "src/tools/clippy", ["clippy_utils"]);
-tool_doc!(Miri, "miri", "src/tools/miri", ["miri"]);
+tool_doc!(Clippy, "clippy", "src/tools/clippy", ["-p", "clippy_utils"]);
+tool_doc!(Miri, "miri", "src/tools/miri", ["-p", "miri"]);
 tool_doc!(
     Cargo,
     "cargo",
@@ -868,25 +879,44 @@ tool_doc!(
     rustc_tool = false,
     in_tree = false,
     [
+        "-p",
         "cargo",
+        "-p",
         "cargo-platform",
+        "-p",
         "cargo-util",
+        "-p",
         "crates-io",
+        "-p",
         "cargo-test-macro",
+        "-p",
         "cargo-test-support",
+        "-p",
         "cargo-credential",
+        "-p",
         "cargo-credential-1password",
+        "-p",
         "mdman",
         // FIXME: this trips a license check in tidy.
+        // "-p",
         // "resolver-tests",
         // FIXME: we should probably document these, but they're different per-platform so we can't use `tool_doc`.
+        // "-p",
         // "cargo-credential-gnome-secret",
+        // "-p",
         // "cargo-credential-macos-keychain",
+        // "-p",
         // "cargo-credential-wincred",
     ]
 );
-tool_doc!(Tidy, "tidy", "src/tools/tidy", rustc_tool = false, ["tidy"]);
-tool_doc!(Bootstrap, "bootstrap", "src/bootstrap", rustc_tool = false, ["bootstrap"]);
+tool_doc!(Tidy, "tidy", "src/tools/tidy", rustc_tool = false, ["-p", "tidy"]);
+tool_doc!(
+    Bootstrap,
+    "bootstrap",
+    "src/bootstrap",
+    rustc_tool = false,
+    ["--lib", "-p", "bootstrap"]
+);
 
 #[derive(Ord, PartialOrd, Debug, Copy, Clone, Hash, PartialEq, Eq)]
 pub struct ErrorIndex {
@@ -959,21 +989,24 @@ impl Step for UnstableBookGen {
     }
 }
 
-fn symlink_dir_force(config: &Config, src: &Path, dst: &Path) -> io::Result<()> {
+fn symlink_dir_force(config: &Config, original: &Path, link: &Path) {
     if config.dry_run() {
-        return Ok(());
+        return;
     }
-    if let Ok(m) = fs::symlink_metadata(dst) {
+    if let Ok(m) = fs::symlink_metadata(link) {
         if m.file_type().is_dir() {
-            fs::remove_dir_all(dst)?;
+            t!(fs::remove_dir_all(link));
         } else {
             // handle directory junctions on windows by falling back to
             // `remove_dir`.
-            fs::remove_file(dst).or_else(|_| fs::remove_dir(dst))?;
+            t!(fs::remove_file(link).or_else(|_| fs::remove_dir(link)));
         }
     }
 
-    symlink_dir(config, src, dst)
+    t!(
+        symlink_dir(config, original, link),
+        format!("failed to create link from {} -> {}", link.display(), original.display())
+    );
 }
 
 #[derive(Ord, PartialOrd, Debug, Copy, Clone, Hash, PartialEq, Eq)]

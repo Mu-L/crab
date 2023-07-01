@@ -34,7 +34,7 @@ use rustc_middle::infer::unify_key::{ConstVarValue, ConstVariableValue};
 use rustc_middle::infer::unify_key::{ConstVariableOrigin, ConstVariableOriginKind};
 use rustc_middle::ty::error::{ExpectedFound, TypeError};
 use rustc_middle::ty::relate::{RelateResult, TypeRelation};
-use rustc_middle::ty::{self, AliasKind, InferConst, ToPredicate, Ty, TyCtxt, TypeVisitableExt};
+use rustc_middle::ty::{self, InferConst, ToPredicate, Ty, TyCtxt, TypeVisitableExt};
 use rustc_middle::ty::{IntType, UintType};
 use rustc_span::DUMMY_SP;
 
@@ -103,17 +103,17 @@ impl<'tcx> InferCtxt<'tcx> {
 
             // We don't expect `TyVar` or `Fresh*` vars at this point with lazy norm.
             (
-                ty::Alias(AliasKind::Projection, _),
+                ty::Alias(..),
                 ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)),
             )
             | (
                 ty::Infer(ty::TyVar(_) | ty::FreshTy(_) | ty::FreshIntTy(_) | ty::FreshFloatTy(_)),
-                ty::Alias(AliasKind::Projection, _),
-            ) if self.tcx.trait_solver_next() => {
+                ty::Alias(..),
+            ) if self.next_trait_solver() => {
                 bug!()
             }
 
-            (_, ty::Alias(..)) | (ty::Alias(..), _) if self.tcx.trait_solver_next() => {
+            (_, ty::Alias(..)) | (ty::Alias(..), _) if self.next_trait_solver() => {
                 relation.register_type_relate_obligation(a, b);
                 Ok(a)
             }
@@ -124,13 +124,10 @@ impl<'tcx> InferCtxt<'tcx> {
             }
 
             // During coherence, opaque types should be treated as *possibly*
-            // equal to each other, even if their generic params differ, as
-            // they could resolve to the same hidden type, even for different
-            // generic params.
-            (
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: a_def_id, .. }),
-                &ty::Alias(ty::Opaque, ty::AliasTy { def_id: b_def_id, .. }),
-            ) if self.intercrate && a_def_id == b_def_id => {
+            // equal to any other type (except for possibly itself). This is an
+            // extremely heavy hammer, but can be relaxed in a fowards-compatible
+            // way later.
+            (&ty::Alias(ty::Opaque, _), _) | (_, &ty::Alias(ty::Opaque, _)) if self.intercrate => {
                 relation.register_predicates([ty::Binder::dummy(ty::PredicateKind::Ambiguous)]);
                 Ok(a)
             }
@@ -227,9 +224,20 @@ impl<'tcx> InferCtxt<'tcx> {
                 return self.unify_const_variable(vid, a, relation.param_env());
             }
             (ty::ConstKind::Unevaluated(..), _) | (_, ty::ConstKind::Unevaluated(..))
-                if self.tcx.features().generic_const_exprs || self.tcx.trait_solver_next() =>
+                if self.tcx.features().generic_const_exprs || self.next_trait_solver() =>
             {
-                relation.register_const_equate_obligation(a, b);
+                let (a, b) = if relation.a_is_expected() { (a, b) } else { (b, a) };
+
+                relation.register_predicates([ty::Binder::dummy(if self.next_trait_solver() {
+                    ty::PredicateKind::AliasRelate(
+                        a.into(),
+                        b.into(),
+                        ty::AliasRelationDirection::Equate,
+                    )
+                } else {
+                    ty::PredicateKind::ConstEquate(a, b)
+                })]);
+
                 return Ok(b);
             }
             _ => {}
@@ -406,7 +414,9 @@ impl<'infcx, 'tcx> CombineFields<'infcx, 'tcx> {
                 self.tcx(),
                 self.trace.cause.clone(),
                 self.param_env,
-                ty::Binder::dummy(ty::PredicateKind::WellFormed(b_ty.into())),
+                ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(
+                    b_ty.into(),
+                ))),
             ));
         }
 
@@ -452,19 +462,6 @@ pub trait ObligationEmittingRelation<'tcx>: TypeRelation<'tcx> {
     /// a default obligation cause, [`ObligationEmittingRelation::register_obligations`] should
     /// be used if control over the obligation causes is required.
     fn register_predicates(&mut self, obligations: impl IntoIterator<Item: ToPredicate<'tcx>>);
-
-    /// Register an obligation that both constants must be equal to each other.
-    ///
-    /// If they aren't equal then the relation doesn't hold.
-    fn register_const_equate_obligation(&mut self, a: ty::Const<'tcx>, b: ty::Const<'tcx>) {
-        let (a, b) = if self.a_is_expected() { (a, b) } else { (b, a) };
-
-        self.register_predicates([ty::Binder::dummy(if self.tcx().trait_solver_next() {
-            ty::PredicateKind::AliasRelate(a.into(), b.into(), ty::AliasRelationDirection::Equate)
-        } else {
-            ty::PredicateKind::ConstEquate(a, b)
-        })]);
-    }
 
     /// Register an obligation that both types must be related to each other according to
     /// the [`ty::AliasRelationDirection`] given by [`ObligationEmittingRelation::alias_relate_direction`]

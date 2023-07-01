@@ -5,10 +5,10 @@ use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::temp_dir::MaybeTempDir;
 use rustc_errors::{ErrorGuaranteed, Handler};
-use rustc_fs_util::fix_windows_verbatim_for_gcc;
+use rustc_fs_util::{fix_windows_verbatim_for_gcc, try_canonicalize};
 use rustc_hir::def_id::{CrateNum, LOCAL_CRATE};
 use rustc_metadata::find_native_static_library;
-use rustc_metadata::fs::{emit_wrapper_file, METADATA_FILENAME};
+use rustc_metadata::fs::{copy_to_stdout, emit_wrapper_file, METADATA_FILENAME};
 use rustc_middle::middle::debugger_visualizer::DebuggerVisualizerFile;
 use rustc_middle::middle::dependency_format::Linkage;
 use rustc_middle::middle::exported_symbols::SymbolExportKind;
@@ -68,6 +68,7 @@ pub fn link_binary<'a>(
 ) -> Result<(), ErrorGuaranteed> {
     let _timer = sess.timer("link_binary");
     let output_metadata = sess.opts.output_types.contains_key(&OutputType::Metadata);
+    let mut tempfiles_for_stdout_output: Vec<PathBuf> = Vec::new();
     for &crate_type in sess.crate_types().iter() {
         // Ignore executable crates if we have -Z no-codegen, as they will error.
         if (sess.opts.unstable_opts.no_codegen || !sess.opts.output_types.should_codegen())
@@ -97,12 +98,15 @@ pub fn link_binary<'a>(
                 .tempdir()
                 .unwrap_or_else(|error| sess.emit_fatal(errors::CreateTempDir { error }));
             let path = MaybeTempDir::new(tmpdir, sess.opts.cg.save_temps);
-            let out_filename = out_filename(
+            let output = out_filename(
                 sess,
                 crate_type,
                 outputs,
                 codegen_results.crate_info.local_crate_name,
             );
+            let crate_name = format!("{}", codegen_results.crate_info.local_crate_name);
+            let out_filename =
+                output.file_for_writing(outputs, OutputType::Exe, Some(crate_name.as_str()));
             match crate_type {
                 CrateType::Rlib => {
                     let _timer = sess.timer("link_rlib");
@@ -152,6 +156,17 @@ pub fn link_binary<'a>(
                     );
                 }
             }
+
+            if output.is_stdout() {
+                if output.is_tty() {
+                    sess.emit_err(errors::BinaryOutputToTty {
+                        shorthand: OutputType::Exe.shorthand(),
+                    });
+                } else if let Err(e) = copy_to_stdout(&out_filename) {
+                    sess.emit_err(errors::CopyPath::new(&out_filename, output.as_path(), e));
+                }
+                tempfiles_for_stdout_output.push(out_filename);
+            }
         }
     }
 
@@ -187,6 +202,11 @@ pub fn link_binary<'a>(
 
         if let Some(ref allocator_module) = codegen_results.allocator_module {
             remove_temps_from_module(allocator_module);
+        }
+
+        // Remove the temporary files if output goes to stdout
+        for temp in tempfiles_for_stdout_output {
+            ensure_removed(sess.diagnostic(), &temp);
         }
 
         // If no requested outputs require linking, then the object temporaries should
@@ -2097,7 +2117,14 @@ fn linker_with_args<'a>(
     cmd.add_as_needed();
 
     // Local native libraries of all kinds.
-    add_local_native_libraries(cmd, sess, archive_builder_builder, codegen_results, tmpdir);
+    add_local_native_libraries(
+        cmd,
+        sess,
+        archive_builder_builder,
+        codegen_results,
+        tmpdir,
+        link_output_kind,
+    );
 
     // Upstream rust crates and their non-dynamic native libraries.
     add_upstream_rust_crates(
@@ -2107,10 +2134,18 @@ fn linker_with_args<'a>(
         codegen_results,
         crate_type,
         tmpdir,
+        link_output_kind,
     );
 
     // Dynamic native libraries from upstream crates.
-    add_upstream_native_libraries(cmd, sess, archive_builder_builder, codegen_results, tmpdir);
+    add_upstream_native_libraries(
+        cmd,
+        sess,
+        archive_builder_builder,
+        codegen_results,
+        tmpdir,
+        link_output_kind,
+    );
 
     // Link with the import library generated for any raw-dylib functions.
     for (raw_dylib_name, raw_dylib_imports) in
@@ -2256,11 +2291,13 @@ fn add_order_independent_options(
     } else if flavor == LinkerFlavor::Bpf {
         cmd.arg("--cpu");
         cmd.arg(&codegen_results.crate_info.target_cpu);
-        cmd.arg("--cpu-features");
-        cmd.arg(match &sess.opts.cg.target_feature {
-            feat if !feat.is_empty() => feat.as_ref(),
-            _ => sess.target.options.features.as_ref(),
-        });
+        if let Some(feat) = [sess.opts.cg.target_feature.as_str(), &sess.target.options.features]
+            .into_iter()
+            .find(|feat| !feat.is_empty())
+        {
+            cmd.arg("--cpu-features");
+            cmd.arg(feat);
+        }
     }
 
     cmd.linker_plugin_lto();
@@ -2365,6 +2402,7 @@ fn add_native_libs_from_crate(
     cnum: CrateNum,
     link_static: bool,
     link_dynamic: bool,
+    link_output_kind: LinkOutputKind,
 ) {
     if !sess.opts.unstable_opts.link_native_libraries {
         // If `-Zlink-native-libraries=false` is set, then the assumption is that an
@@ -2444,8 +2482,16 @@ fn add_native_libs_from_crate(
                 }
             }
             NativeLibKind::Unspecified => {
-                if link_dynamic {
-                    cmd.link_dylib(name, verbatim, true);
+                // If we are generating a static binary, prefer static library when the
+                // link kind is unspecified.
+                if !link_output_kind.can_link_dylib() && !sess.target.crt_static_allows_dylibs {
+                    if link_static {
+                        cmd.link_staticlib(name, verbatim)
+                    }
+                } else {
+                    if link_dynamic {
+                        cmd.link_dylib(name, verbatim, true);
+                    }
                 }
             }
             NativeLibKind::Framework { as_needed } => {
@@ -2472,6 +2518,7 @@ fn add_local_native_libraries(
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     tmpdir: &Path,
+    link_output_kind: LinkOutputKind,
 ) {
     if sess.opts.unstable_opts.link_native_libraries {
         // User-supplied library search paths (-L on the command line). These are the same paths
@@ -2501,6 +2548,7 @@ fn add_local_native_libraries(
         LOCAL_CRATE,
         link_static,
         link_dynamic,
+        link_output_kind,
     );
 }
 
@@ -2511,6 +2559,7 @@ fn add_upstream_rust_crates<'a>(
     codegen_results: &CodegenResults,
     crate_type: CrateType,
     tmpdir: &Path,
+    link_output_kind: LinkOutputKind,
 ) {
     // All of the heavy lifting has previously been accomplished by the
     // dependency_format module of the compiler. This is just crawling the
@@ -2588,6 +2637,7 @@ fn add_upstream_rust_crates<'a>(
             cnum,
             link_static,
             link_dynamic,
+            link_output_kind,
         );
     }
 }
@@ -2598,6 +2648,7 @@ fn add_upstream_native_libraries(
     archive_builder_builder: &dyn ArchiveBuilderBuilder,
     codegen_results: &CodegenResults,
     tmpdir: &Path,
+    link_output_kind: LinkOutputKind,
 ) {
     let search_path = OnceCell::new();
     for &cnum in &codegen_results.crate_info.used_crates {
@@ -2626,7 +2677,32 @@ fn add_upstream_native_libraries(
             cnum,
             link_static,
             link_dynamic,
+            link_output_kind,
         );
+    }
+}
+
+// Rehome lib paths (which exclude the library file name) that point into the sysroot lib directory
+// to be relative to the sysroot directory, which may be a relative path specified by the user.
+//
+// If the sysroot is a relative path, and the sysroot libs are specified as an absolute path, the
+// linker command line can be non-deterministic due to the paths including the current working
+// directory. The linker command line needs to be deterministic since it appears inside the PDB
+// file generated by the MSVC linker. See https://github.com/rust-lang/rust/issues/112586.
+//
+// The returned path will always have `fix_windows_verbatim_for_gcc()` applied to it.
+fn rehome_sysroot_lib_dir<'a>(sess: &'a Session, lib_dir: &Path) -> PathBuf {
+    let sysroot_lib_path = sess.target_filesearch(PathKind::All).get_lib_path();
+    let canonical_sysroot_lib_path =
+        { try_canonicalize(&sysroot_lib_path).unwrap_or_else(|_| sysroot_lib_path.clone()) };
+
+    let canonical_lib_dir = try_canonicalize(lib_dir).unwrap_or_else(|_| lib_dir.to_path_buf());
+    if canonical_lib_dir == canonical_sysroot_lib_path {
+        // This path, returned by `target_filesearch().get_lib_path()`, has
+        // already had `fix_windows_verbatim_for_gcc()` applied if needed.
+        sysroot_lib_path
+    } else {
+        fix_windows_verbatim_for_gcc(&lib_dir)
     }
 }
 
@@ -2661,7 +2737,13 @@ fn add_static_crate<'a>(
     let cratepath = &src.rlib.as_ref().unwrap().0;
 
     let mut link_upstream = |path: &Path| {
-        cmd.link_rlib(&fix_windows_verbatim_for_gcc(path));
+        let rlib_path = if let Some(dir) = path.parent() {
+            let file_name = path.file_name().expect("rlib path has no file name path component");
+            rehome_sysroot_lib_dir(sess, &dir).join(file_name)
+        } else {
+            fix_windows_verbatim_for_gcc(path)
+        };
+        cmd.link_rlib(&rlib_path);
     };
 
     if !are_upstream_rust_objects_already_included(sess)
@@ -2730,7 +2812,7 @@ fn add_dynamic_crate(cmd: &mut dyn Linker, sess: &Session, cratepath: &Path) {
     // what its name is
     let parent = cratepath.parent();
     if let Some(dir) = parent {
-        cmd.include_path(&fix_windows_verbatim_for_gcc(dir));
+        cmd.include_path(&rehome_sysroot_lib_dir(sess, dir));
     }
     let stem = cratepath.file_stem().unwrap().to_str().unwrap();
     // Convert library file-stem into a cc -l argument.

@@ -45,12 +45,7 @@ pub(super) fn compare_impl_method<'tcx>(
     debug!("compare_impl_method(impl_trait_ref={:?})", impl_trait_ref);
 
     let _: Result<_, ErrorGuaranteed> = try {
-        compare_self_type(tcx, impl_m, trait_m, impl_trait_ref)?;
-        compare_number_of_generics(tcx, impl_m, trait_m, false)?;
-        compare_generic_param_kinds(tcx, impl_m, trait_m, false)?;
-        compare_number_of_method_arguments(tcx, impl_m, trait_m)?;
-        compare_synthetic_generics(tcx, impl_m, trait_m)?;
-        compare_asyncness(tcx, impl_m, trait_m)?;
+        check_method_is_structurally_compatible(tcx, impl_m, trait_m, impl_trait_ref, false)?;
         compare_method_predicate_entailment(
             tcx,
             impl_m,
@@ -59,6 +54,26 @@ pub(super) fn compare_impl_method<'tcx>(
             CheckImpliedWfMode::Check,
         )?;
     };
+}
+
+/// Checks a bunch of different properties of the impl/trait methods for
+/// compatibility, such as asyncness, number of argument, self receiver kind,
+/// and number of early- and late-bound generics.
+fn check_method_is_structurally_compatible<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    impl_m: ty::AssocItem,
+    trait_m: ty::AssocItem,
+    impl_trait_ref: ty::TraitRef<'tcx>,
+    delay: bool,
+) -> Result<(), ErrorGuaranteed> {
+    compare_self_type(tcx, impl_m, trait_m, impl_trait_ref, delay)?;
+    compare_number_of_generics(tcx, impl_m, trait_m, delay)?;
+    compare_generic_param_kinds(tcx, impl_m, trait_m, delay)?;
+    compare_number_of_method_arguments(tcx, impl_m, trait_m, delay)?;
+    compare_synthetic_generics(tcx, impl_m, trait_m, delay)?;
+    compare_asyncness(tcx, impl_m, trait_m, delay)?;
+    check_region_bounds_on_impl_item(tcx, impl_m, trait_m, delay)?;
+    Ok(())
 }
 
 /// This function is best explained by example. Consider a trait with it's implementation:
@@ -177,9 +192,6 @@ fn compare_method_predicate_entailment<'tcx>(
     let impl_m_predicates = tcx.predicates_of(impl_m.def_id);
     let trait_m_predicates = tcx.predicates_of(trait_m.def_id);
 
-    // Check region bounds.
-    check_region_bounds_on_impl_item(tcx, impl_m, trait_m, false)?;
-
     // Create obligations for each predicate declared by the impl
     // definition in the context of the trait's parameter
     // environment. We can't just use `impl_env.caller_bounds`,
@@ -208,7 +220,7 @@ fn compare_method_predicate_entailment<'tcx>(
     // the new hybrid bounds we computed.
     let normalize_cause = traits::ObligationCause::misc(impl_m_span, impl_m_def_id);
     let param_env = ty::ParamEnv::new(
-        tcx.mk_predicates(&hybrid_preds.predicates),
+        tcx.mk_clauses(&hybrid_preds.predicates),
         Reveal::UserFacing,
         hir::Constness::NotConst,
     );
@@ -302,14 +314,16 @@ fn compare_method_predicate_entailment<'tcx>(
         return Err(emitted);
     }
 
-    if check_implied_wf == CheckImpliedWfMode::Check {
+    if check_implied_wf == CheckImpliedWfMode::Check && !(impl_sig, trait_sig).references_error() {
         // We need to check that the impl's args are well-formed given
         // the hybrid param-env (impl + trait method where-clauses).
         ocx.register_obligation(traits::Obligation::new(
             infcx.tcx,
             ObligationCause::dummy(),
             param_env,
-            ty::Binder::dummy(ty::PredicateKind::WellFormed(unnormalized_impl_fty.into())),
+            ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(
+                unnormalized_impl_fty.into(),
+            ))),
         ));
     }
 
@@ -534,6 +548,7 @@ fn compare_asyncness<'tcx>(
     tcx: TyCtxt<'tcx>,
     impl_m: ty::AssocItem,
     trait_m: ty::AssocItem,
+    delay: bool,
 ) -> Result<(), ErrorGuaranteed> {
     if tcx.asyncness(trait_m.def_id) == hir::IsAsync::Async {
         match tcx.fn_sig(impl_m.def_id).skip_binder().skip_binder().output().kind() {
@@ -544,11 +559,14 @@ fn compare_asyncness<'tcx>(
                 // We don't know if it's ok, but at least it's already an error.
             }
             _ => {
-                return Err(tcx.sess.emit_err(crate::errors::AsyncTraitImplShouldBeAsync {
-                    span: tcx.def_span(impl_m.def_id),
-                    method_name: trait_m.name,
-                    trait_item_span: tcx.hir().span_if_local(trait_m.def_id),
-                }));
+                return Err(tcx
+                    .sess
+                    .create_err(crate::errors::AsyncTraitImplShouldBeAsync {
+                        span: tcx.def_span(impl_m.def_id),
+                        method_name: trait_m.name,
+                        trait_item_span: tcx.hir().span_if_local(trait_m.def_id),
+                    })
+                    .emit_unless(delay));
             }
         };
     }
@@ -602,9 +620,7 @@ pub(super) fn collect_return_position_impl_trait_in_trait_tys<'tcx>(
 
     // First, check a few of the same things as `compare_impl_method`,
     // just so we don't ICE during substitution later.
-    compare_number_of_generics(tcx, impl_m, trait_m, true)?;
-    compare_generic_param_kinds(tcx, impl_m, trait_m, true)?;
-    check_region_bounds_on_impl_item(tcx, impl_m, trait_m, true)?;
+    check_method_is_structurally_compatible(tcx, impl_m, trait_m, impl_trait_ref, true)?;
 
     let trait_to_impl_substs = impl_trait_ref.substs;
 
@@ -1097,6 +1113,7 @@ fn compare_self_type<'tcx>(
     impl_m: ty::AssocItem,
     trait_m: ty::AssocItem,
     impl_trait_ref: ty::TraitRef<'tcx>,
+    delay: bool,
 ) -> Result<(), ErrorGuaranteed> {
     // Try to give more informative error messages about self typing
     // mismatches. Note that any mismatch will also be detected
@@ -1145,7 +1162,7 @@ fn compare_self_type<'tcx>(
             } else {
                 err.note_trait_signature(trait_m.name, trait_m.signature(tcx));
             }
-            return Err(err.emit());
+            return Err(err.emit_unless(delay));
         }
 
         (true, false) => {
@@ -1166,7 +1183,7 @@ fn compare_self_type<'tcx>(
                 err.note_trait_signature(trait_m.name, trait_m.signature(tcx));
             }
 
-            return Err(err.emit());
+            return Err(err.emit_unless(delay));
         }
     }
 
@@ -1216,7 +1233,7 @@ fn compare_number_of_generics<'tcx>(
     // has mismatched type or const generic arguments, then the method that it's
     // inheriting the generics from will also have mismatched arguments, and
     // we'll report an error for that instead. Delay a bug for safety, though.
-    if tcx.opt_rpitit_info(trait_.def_id).is_some() {
+    if trait_.opt_rpitit_info.is_some() {
         return Err(tcx.sess.delay_span_bug(
             rustc_span::DUMMY_SP,
             "errors comparing numbers of generics of trait/impl functions were not emitted",
@@ -1352,6 +1369,7 @@ fn compare_number_of_method_arguments<'tcx>(
     tcx: TyCtxt<'tcx>,
     impl_m: ty::AssocItem,
     trait_m: ty::AssocItem,
+    delay: bool,
 ) -> Result<(), ErrorGuaranteed> {
     let impl_m_fty = tcx.fn_sig(impl_m.def_id);
     let trait_m_fty = tcx.fn_sig(trait_m.def_id);
@@ -1422,7 +1440,7 @@ fn compare_number_of_method_arguments<'tcx>(
             ),
         );
 
-        return Err(err.emit());
+        return Err(err.emit_unless(delay));
     }
 
     Ok(())
@@ -1432,6 +1450,7 @@ fn compare_synthetic_generics<'tcx>(
     tcx: TyCtxt<'tcx>,
     impl_m: ty::AssocItem,
     trait_m: ty::AssocItem,
+    delay: bool,
 ) -> Result<(), ErrorGuaranteed> {
     // FIXME(chrisvittal) Clean up this function, list of FIXME items:
     //     1. Better messages for the span labels
@@ -1551,7 +1570,7 @@ fn compare_synthetic_generics<'tcx>(
                 }
                 _ => unreachable!(),
             }
-            error_found = Some(err.emit());
+            error_found = Some(err.emit_unless(delay));
         }
     }
     if let Some(reported) = error_found { Err(reported) } else { Ok(()) }
@@ -1816,7 +1835,7 @@ fn compare_type_predicate_entailment<'tcx>(
     let impl_ty_span = tcx.def_span(impl_ty_def_id);
     let normalize_cause = traits::ObligationCause::misc(impl_ty_span, impl_ty_def_id);
     let param_env = ty::ParamEnv::new(
-        tcx.mk_predicates(&hybrid_preds.predicates),
+        tcx.mk_clauses(&hybrid_preds.predicates),
         Reveal::UserFacing,
         hir::Constness::NotConst,
     );
@@ -1992,7 +2011,7 @@ pub(super) fn check_type_bounds<'tcx>(
                 .to_predicate(tcx),
             ),
         };
-        ty::ParamEnv::new(tcx.mk_predicates(&predicates), Reveal::UserFacing, param_env.constness())
+        ty::ParamEnv::new(tcx.mk_clauses(&predicates), Reveal::UserFacing, param_env.constness())
     };
     debug!(?normalize_param_env);
 
@@ -2006,7 +2025,7 @@ pub(super) fn check_type_bounds<'tcx>(
     // A synthetic impl Trait for RPITIT desugaring has no HIR, which we currently use to get the
     // span for an impl's associated type. Instead, for these, use the def_span for the synthesized
     // associated type.
-    let impl_ty_span = if tcx.opt_rpitit_info(impl_ty.def_id).is_some() {
+    let impl_ty_span = if impl_ty.opt_rpitit_info.is_some() {
         tcx.def_span(impl_ty_def_id)
     } else {
         match tcx.hir().get_by_def_id(impl_ty_def_id) {

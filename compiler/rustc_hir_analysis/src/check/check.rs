@@ -299,7 +299,7 @@ pub(super) fn check_opaque_for_inheriting_lifetimes(
         }
     }
 
-    if let ItemKind::OpaqueTy(hir::OpaqueTy {
+    if let ItemKind::OpaqueTy(&hir::OpaqueTy {
         origin: hir::OpaqueTyOrigin::AsyncFn(..) | hir::OpaqueTyOrigin::FnReturn(..),
         in_trait,
         ..
@@ -439,7 +439,8 @@ fn check_opaque_meets_bounds<'tcx>(
     // Additionally require the hidden type to be well-formed with only the generics of the opaque type.
     // Defining use functions may have more bounds than the opaque type, which is ok, as long as the
     // hidden type is well formed even without those bounds.
-    let predicate = ty::Binder::dummy(ty::PredicateKind::WellFormed(hidden_ty.into()));
+    let predicate =
+        ty::Binder::dummy(ty::PredicateKind::Clause(ty::ClauseKind::WellFormed(hidden_ty.into())));
     ocx.register_obligation(Obligation::new(tcx, misc_cause, param_env, predicate));
 
     // Check that all obligations are satisfied by the implementation's
@@ -562,8 +563,8 @@ fn check_item_type(tcx: TyCtxt<'_>, id: hir::ItemId) {
             check_union(tcx, id.owner_id.def_id);
         }
         DefKind::OpaqueTy => {
-            let opaque = tcx.hir().expect_item(id.owner_id.def_id).expect_opaque_ty();
-            if let hir::OpaqueTyOrigin::FnReturn(fn_def_id) | hir::OpaqueTyOrigin::AsyncFn(fn_def_id) = opaque.origin
+            let origin = tcx.opaque_type_origin(id.owner_id.def_id);
+            if let hir::OpaqueTyOrigin::FnReturn(fn_def_id) | hir::OpaqueTyOrigin::AsyncFn(fn_def_id) = origin
                 && let hir::Node::TraitItem(trait_item) = tcx.hir().get_by_def_id(fn_def_id)
                 && let (_, hir::TraitFn::Required(..)) = trait_item.expect_fn()
             {
@@ -1549,7 +1550,7 @@ pub(super) fn check_generator_obligations(tcx: TyCtxt<'_>, def_id: LocalDefId) {
         .with_opaque_type_inference(DefiningAnchor::Bind(def_id))
         .build();
 
-    let mut fulfillment_cx = <dyn TraitEngine<'_>>::new(infcx.tcx);
+    let mut fulfillment_cx = <dyn TraitEngine<'_>>::new(&infcx);
     for (predicate, cause) in generator_interior_predicates {
         let obligation = Obligation::new(tcx, cause.clone(), param_env, *predicate);
         fulfillment_cx.register_predicate_obligation(&infcx, obligation);

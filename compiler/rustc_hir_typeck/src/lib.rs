@@ -5,7 +5,6 @@
 #![feature(box_patterns)]
 #![feature(min_specialization)]
 #![feature(control_flow_enum)]
-#![feature(drain_filter)]
 #![feature(option_as_slice)]
 #![allow(rustc::potential_query_instability)]
 #![recursion_limit = "256"]
@@ -88,13 +87,6 @@ macro_rules! type_error_struct {
 
         err
     })
-}
-
-/// The type of a local binding, including the revealed type for anon types.
-#[derive(Copy, Clone, Debug)]
-pub struct LocalTy<'tcx> {
-    decl_ty: Ty<'tcx>,
-    revealed_ty: Ty<'tcx>,
 }
 
 /// If this `DefId` is a "primary tables entry", returns

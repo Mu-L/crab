@@ -25,7 +25,7 @@ use rustc_middle::mir::interpret::{AllocDecodingSession, AllocDecodingState};
 use rustc_middle::ty::codec::TyDecoder;
 use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::GeneratorDiagnosticData;
-use rustc_middle::ty::{self, ParameterizedOverTcx, Predicate, Ty, TyCtxt, Visibility};
+use rustc_middle::ty::{self, ParameterizedOverTcx, Ty, TyCtxt, Visibility};
 use rustc_serialize::opaque::MemDecoder;
 use rustc_serialize::{Decodable, Decoder};
 use rustc_session::cstore::{
@@ -636,7 +636,7 @@ impl<'a, 'tcx> Decodable<DecodeContext<'a, 'tcx>> for Symbol {
     }
 }
 
-impl<'a, 'tcx> Decodable<DecodeContext<'a, 'tcx>> for &'tcx [(ty::Predicate<'tcx>, Span)] {
+impl<'a, 'tcx> Decodable<DecodeContext<'a, 'tcx>> for &'tcx [(ty::Clause<'tcx>, Span)] {
     fn decode(d: &mut DecodeContext<'a, 'tcx>) -> Self {
         ty::codec::RefDecodable::decode(d)
     }
@@ -854,7 +854,7 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
         self,
         index: DefIndex,
         tcx: TyCtxt<'tcx>,
-    ) -> ty::EarlyBinder<&'tcx [(Predicate<'tcx>, Span)]> {
+    ) -> ty::EarlyBinder<&'tcx [(ty::Clause<'tcx>, Span)]> {
         let lazy = self.root.tables.explicit_item_bounds.get(self, index);
         let output = if lazy.is_default() {
             &mut []
@@ -993,6 +993,15 @@ impl<'a, 'tcx> CrateMetadataRef<'a> {
                 .decode(self)
                 .map(move |(def_index, index)| (self.local_def_id(def_index), index)),
         )
+    }
+
+    fn get_stripped_cfg_items(self, cnum: CrateNum, tcx: TyCtxt<'tcx>) -> &'tcx [StrippedCfgItem] {
+        let item_names = self
+            .root
+            .stripped_cfg_items
+            .decode((self, tcx))
+            .map(|item| item.map_mod_id(|index| DefId { krate: cnum, index }));
+        tcx.arena.alloc_from_iter(item_names)
     }
 
     /// Iterates over the diagnostic items in the given crate.

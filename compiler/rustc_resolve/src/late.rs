@@ -6,6 +6,7 @@
 //! If you wonder why there's no `early.rs`, that's because it's split into three files -
 //! `build_reduced_graph.rs`, `macros.rs` and `imports.rs`.
 
+use crate::errors::ImportsCannotReferTo;
 use crate::BindingKey;
 use crate::{path_names_to_string, rustdoc, BindingError, Finalize, LexicalScopeBinding};
 use crate::{Module, ModuleOrUniformRoot, NameBinding, ParentScope, PathResult};
@@ -1631,9 +1632,13 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                                 ..
                             } = &rib.kind
                             {
-                                diag.span_help(
-                                    *span,
-                                    "consider introducing a higher-ranked lifetime here with `for<'a>`",
+                                diag.multipart_suggestion(
+                                    "consider introducing a higher-ranked lifetime here",
+                                    vec![
+                                        (span.shrink_to_lo(), "for<'a> ".into()),
+                                        (lifetime.ident.span.shrink_to_hi(), "'a ".into()),
+                                    ],
+                                    Applicability::MachineApplicable,
                                 );
                                 break;
                             }
@@ -2244,12 +2249,13 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                 _ => &[TypeNS],
             };
             let report_error = |this: &Self, ns| {
-                let what = if ns == TypeNS { "type parameters" } else { "local variables" };
                 if this.should_report_errs() {
+                    let what = if ns == TypeNS { "type parameters" } else { "local variables" };
                     this.r
                         .tcx
                         .sess
-                        .span_err(ident.span, format!("imports cannot refer to {}", what));
+                        .create_err(ImportsCannotReferTo { span: ident.span, what })
+                        .emit();
                 }
             };
 
@@ -3524,7 +3530,7 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                     None
                 };
 
-                this.r.use_injections.push(UseError {
+                let ue = UseError {
                     err,
                     candidates,
                     def_id,
@@ -3532,7 +3538,9 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
                     suggestion,
                     path: path.into(),
                     is_call: source.is_call(),
-                });
+                };
+
+                this.r.use_injections.push(ue);
             }
 
             PartialRes::new(Res::Err)
@@ -3866,8 +3874,22 @@ impl<'a: 'ast, 'b, 'ast, 'tcx> LateResolutionVisitor<'a, 'b, 'ast, 'tcx> {
             PathResult::Module(ModuleOrUniformRoot::Module(module)) => {
                 PartialRes::new(module.res().unwrap())
             }
-            PathResult::Failed { is_error_from_last_segment: false, span, label, suggestion } => {
-                return Err(respan(span, ResolutionError::FailedToResolve { label, suggestion }));
+            PathResult::Failed {
+                is_error_from_last_segment: false,
+                span,
+                label,
+                suggestion,
+                module,
+            } => {
+                return Err(respan(
+                    span,
+                    ResolutionError::FailedToResolve {
+                        last_segment: None,
+                        label,
+                        suggestion,
+                        module,
+                    },
+                ));
             }
             PathResult::Module(..) | PathResult::Failed { .. } => return Ok(None),
             PathResult::Indeterminate => bug!("indeterminate path result in resolve_qpath"),

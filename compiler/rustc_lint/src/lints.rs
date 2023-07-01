@@ -10,7 +10,7 @@ use rustc_errors::{
 use rustc_hir::def_id::DefId;
 use rustc_macros::{LintDiagnostic, Subdiagnostic};
 use rustc_middle::ty::{
-    inhabitedness::InhabitedPredicate, PolyExistentialTraitRef, Predicate, Ty, TyCtxt,
+    inhabitedness::InhabitedPredicate, Clause, PolyExistentialTraitRef, Ty, TyCtxt,
 };
 use rustc_session::parse::ParseSess;
 use rustc_span::{edition::Edition, sym, symbol::Ident, Span, Symbol};
@@ -352,7 +352,7 @@ impl AddToDiagnostic for BuiltinTypeAliasGenericBoundsSuggestion {
 #[diag(lint_builtin_trivial_bounds)]
 pub struct BuiltinTrivialBounds<'a> {
     pub predicate_kind_name: &'a str,
-    pub predicate: Predicate<'a>,
+    pub predicate: Clause<'a>,
 }
 
 #[derive(LintDiagnostic)]
@@ -697,6 +697,25 @@ pub struct ForgetCopyDiag<'a> {
     pub arg_ty: Ty<'a>,
     #[label]
     pub label: Span,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_undropped_manually_drops)]
+pub struct UndroppedManuallyDropsDiag<'a> {
+    pub arg_ty: Ty<'a>,
+    #[label]
+    pub label: Span,
+    #[subdiagnostic]
+    pub suggestion: UndroppedManuallyDropsSuggestion,
+}
+
+#[derive(Subdiagnostic)]
+#[multipart_suggestion(lint_suggestion, applicability = "machine-applicable")]
+pub struct UndroppedManuallyDropsSuggestion {
+    #[suggestion_part(code = "std::mem::ManuallyDrop::into_inner(")]
+    pub start_span: Span,
+    #[suggestion_part(code = ")")]
+    pub end_span: Span,
 }
 
 // invalid_from_utf8.rs
@@ -1212,11 +1231,15 @@ pub struct NoopMethodCallDiag<'a> {
 }
 
 #[derive(LintDiagnostic)]
-#[diag(lint_suspicious_double_ref_op)]
-pub struct SuspiciousDoubleRefDiag<'a> {
-    pub call: Symbol,
+#[diag(lint_suspicious_double_ref_deref)]
+pub struct SuspiciousDoubleRefDerefDiag<'a> {
     pub ty: Ty<'a>,
-    pub op: &'static str,
+}
+
+#[derive(LintDiagnostic)]
+#[diag(lint_suspicious_double_ref_clone)]
+pub struct SuspiciousDoubleRefCloneDiag<'a> {
+    pub ty: Ty<'a>,
 }
 
 // pass_by_value.rs
@@ -1239,7 +1262,7 @@ pub struct RedundantSemicolonsDiag {
 
 // traits.rs
 pub struct DropTraitConstraintsDiag<'a> {
-    pub predicate: Predicate<'a>,
+    pub predicate: Clause<'a>,
     pub tcx: TyCtxt<'a>,
     pub def_id: DefId,
 }
@@ -1323,6 +1346,8 @@ pub struct OverflowingBinHex<'a> {
     pub sign: OverflowingBinHexSign,
     #[subdiagnostic]
     pub sub: Option<OverflowingBinHexSub<'a>>,
+    #[subdiagnostic]
+    pub sign_bit_sub: Option<OverflowingBinHexSignBitSub<'a>>,
 }
 
 pub enum OverflowingBinHexSign {
@@ -1365,6 +1390,21 @@ pub enum OverflowingBinHexSub<'a> {
     },
     #[help(lint_help)]
     Help { suggestion_ty: &'a str },
+}
+
+#[derive(Subdiagnostic)]
+#[suggestion(
+    lint_sign_bit_suggestion,
+    code = "{lit_no_suffix}{uint_ty} as {int_ty}",
+    applicability = "maybe-incorrect"
+)]
+pub struct OverflowingBinHexSignBitSub<'a> {
+    #[primary_span]
+    pub span: Span,
+    pub lit_no_suffix: &'a str,
+    pub negative_val: String,
+    pub uint_ty: &'a str,
+    pub int_ty: &'a str,
 }
 
 #[derive(LintDiagnostic)]
@@ -1414,6 +1454,36 @@ pub struct OverflowingLiteral<'a> {
 #[derive(LintDiagnostic)]
 #[diag(lint_unused_comparisons)]
 pub struct UnusedComparisons;
+
+#[derive(LintDiagnostic)]
+pub enum InvalidNanComparisons {
+    #[diag(lint_invalid_nan_comparisons_eq_ne)]
+    EqNe {
+        #[subdiagnostic]
+        suggestion: InvalidNanComparisonsSuggestion,
+    },
+    #[diag(lint_invalid_nan_comparisons_lt_le_gt_ge)]
+    LtLeGtGe,
+}
+
+#[derive(Subdiagnostic)]
+pub enum InvalidNanComparisonsSuggestion {
+    #[multipart_suggestion(
+        lint_suggestion,
+        style = "verbose",
+        applicability = "machine-applicable"
+    )]
+    Spanful {
+        #[suggestion_part(code = "!")]
+        neg: Option<Span>,
+        #[suggestion_part(code = ".is_nan()")]
+        float: Span,
+        #[suggestion_part(code = "")]
+        nan_plus_binop: Span,
+    },
+    #[help(lint_suggestion)]
+    Spanless,
+}
 
 pub struct ImproperCTypes<'a> {
     pub ty: Ty<'a>,
@@ -1485,8 +1555,29 @@ pub struct UnusedOp<'a> {
     pub op: &'a str,
     #[label]
     pub label: Span,
-    #[suggestion(style = "verbose", code = "let _ = ", applicability = "maybe-incorrect")]
-    pub suggestion: Span,
+    #[subdiagnostic]
+    pub suggestion: UnusedOpSuggestion,
+}
+
+#[derive(Subdiagnostic)]
+pub enum UnusedOpSuggestion {
+    #[suggestion(
+        lint_suggestion,
+        style = "verbose",
+        code = "let _ = ",
+        applicability = "maybe-incorrect"
+    )]
+    NormalExpr {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(lint_suggestion, style = "verbose", applicability = "maybe-incorrect")]
+    BlockTailExpr {
+        #[suggestion_part(code = "let _ = ")]
+        before_span: Span,
+        #[suggestion_part(code = ";")]
+        after_span: Span,
+    },
 }
 
 #[derive(LintDiagnostic)]
@@ -1529,15 +1620,25 @@ pub struct UnusedDef<'a, 'b> {
 }
 
 #[derive(Subdiagnostic)]
-#[suggestion(
-    lint_suggestion,
-    style = "verbose",
-    code = "let _ = ",
-    applicability = "maybe-incorrect"
-)]
-pub struct UnusedDefSuggestion {
-    #[primary_span]
-    pub span: Span,
+
+pub enum UnusedDefSuggestion {
+    #[suggestion(
+        lint_suggestion,
+        style = "verbose",
+        code = "let _ = ",
+        applicability = "maybe-incorrect"
+    )]
+    NormalExpr {
+        #[primary_span]
+        span: Span,
+    },
+    #[multipart_suggestion(lint_suggestion, style = "verbose", applicability = "maybe-incorrect")]
+    BlockTailExpr {
+        #[suggestion_part(code = "let _ = ")]
+        before_span: Span,
+        #[suggestion_part(code = ";")]
+        after_span: Span,
+    },
 }
 
 // Needed because of def_path_str

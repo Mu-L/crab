@@ -6,6 +6,7 @@ pub use self::RegionVariableOrigin::*;
 pub use self::SubregionOrigin::*;
 pub use self::ValuePairs::*;
 pub use combine::ObligationEmittingRelation;
+use rustc_data_structures::undo_log::UndoLogs;
 
 use self::opaque_types::OpaqueTypeStorage;
 pub(crate) use self::undo_log::{InferCtxtUndoLogs, Snapshot, UndoLog};
@@ -297,9 +298,6 @@ pub struct InferCtxt<'tcx> {
     // FIXME(matthewjasper) Merge into `tainted_by_errors`
     err_count_on_creation: usize,
 
-    /// This flag is true while there is an active snapshot.
-    in_snapshot: Cell<bool>,
-
     /// What is the innermost universe we have created? Starts out as
     /// `UniverseIndex::root()` but grows from there as we enter
     /// universal quantifiers.
@@ -330,6 +328,8 @@ pub struct InferCtxt<'tcx> {
     /// there is no type that the user could *actually name* that
     /// would satisfy it. This avoids crippling inference, basically.
     pub intercrate: bool,
+
+    next_trait_solver: bool,
 }
 
 /// See the `error_reporting` module for more details.
@@ -545,6 +545,9 @@ pub struct InferCtxtBuilder<'tcx> {
     skip_leak_check: bool,
     /// Whether we are in coherence mode.
     intercrate: bool,
+    /// Whether we should use the new trait solver in the local inference context,
+    /// which affects things like which solver is used in `predicate_may_hold`.
+    next_trait_solver: bool,
 }
 
 pub trait TyCtxtInferExt<'tcx> {
@@ -559,6 +562,7 @@ impl<'tcx> TyCtxtInferExt<'tcx> for TyCtxt<'tcx> {
             considering_regions: true,
             skip_leak_check: false,
             intercrate: false,
+            next_trait_solver: self.next_trait_solver_globally(),
         }
     }
 }
@@ -572,6 +576,11 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
     /// in mir borrowck.
     pub fn with_opaque_type_inference(mut self, defining_use_anchor: DefiningAnchor) -> Self {
         self.defining_use_anchor = defining_use_anchor;
+        self
+    }
+
+    pub fn with_next_trait_solver(mut self, next_trait_solver: bool) -> Self {
+        self.next_trait_solver = next_trait_solver;
         self
     }
 
@@ -617,6 +626,7 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             considering_regions,
             skip_leak_check,
             intercrate,
+            next_trait_solver,
         } = *self;
         InferCtxt {
             tcx,
@@ -631,9 +641,9 @@ impl<'tcx> InferCtxtBuilder<'tcx> {
             reported_closure_mismatch: Default::default(),
             tainted_by_errors: Cell::new(None),
             err_count_on_creation: tcx.sess.err_count(),
-            in_snapshot: Cell::new(false),
             universe: Cell::new(ty::UniverseIndex::ROOT),
             intercrate,
+            next_trait_solver,
         }
     }
 }
@@ -666,10 +676,13 @@ pub struct CombinedSnapshot<'tcx> {
     undo_snapshot: Snapshot<'tcx>,
     region_constraints_snapshot: RegionSnapshot,
     universe: ty::UniverseIndex,
-    was_in_snapshot: bool,
 }
 
 impl<'tcx> InferCtxt<'tcx> {
+    pub fn next_trait_solver(&self) -> bool {
+        self.next_trait_solver
+    }
+
     /// Creates a `TypeErrCtxt` for emitting various inference errors.
     /// During typeck, use `FnCtxt::err_ctxt` instead.
     pub fn err_ctxt(&self) -> TypeErrCtxt<'_, 'tcx> {
@@ -683,10 +696,6 @@ impl<'tcx> InferCtxt<'tcx> {
                 vec![(ty, vec![])]
             }),
         }
-    }
-
-    pub fn is_in_snapshot(&self) -> bool {
-        self.in_snapshot.get()
     }
 
     pub fn freshen<T: TypeFoldable<TyCtxt<'tcx>>>(&self, t: T) -> T {
@@ -749,10 +758,16 @@ impl<'tcx> InferCtxt<'tcx> {
         }
     }
 
+    pub fn in_snapshot(&self) -> bool {
+        UndoLogs::<UndoLog<'tcx>>::in_snapshot(&self.inner.borrow_mut().undo_log)
+    }
+
+    pub fn num_open_snapshots(&self) -> usize {
+        UndoLogs::<UndoLog<'tcx>>::num_open_snapshots(&self.inner.borrow_mut().undo_log)
+    }
+
     fn start_snapshot(&self) -> CombinedSnapshot<'tcx> {
         debug!("start_snapshot()");
-
-        let in_snapshot = self.in_snapshot.replace(true);
 
         let mut inner = self.inner.borrow_mut();
 
@@ -760,20 +775,13 @@ impl<'tcx> InferCtxt<'tcx> {
             undo_snapshot: inner.undo_log.start_snapshot(),
             region_constraints_snapshot: inner.unwrap_region_constraints().start_snapshot(),
             universe: self.universe(),
-            was_in_snapshot: in_snapshot,
         }
     }
 
     #[instrument(skip(self, snapshot), level = "debug")]
     fn rollback_to(&self, cause: &str, snapshot: CombinedSnapshot<'tcx>) {
-        let CombinedSnapshot {
-            undo_snapshot,
-            region_constraints_snapshot,
-            universe,
-            was_in_snapshot,
-        } = snapshot;
+        let CombinedSnapshot { undo_snapshot, region_constraints_snapshot, universe } = snapshot;
 
-        self.in_snapshot.set(was_in_snapshot);
         self.universe.set(universe);
 
         let mut inner = self.inner.borrow_mut();
@@ -783,14 +791,8 @@ impl<'tcx> InferCtxt<'tcx> {
 
     #[instrument(skip(self, snapshot), level = "debug")]
     fn commit_from(&self, snapshot: CombinedSnapshot<'tcx>) {
-        let CombinedSnapshot {
-            undo_snapshot,
-            region_constraints_snapshot: _,
-            universe: _,
-            was_in_snapshot,
-        } = snapshot;
-
-        self.in_snapshot.set(was_in_snapshot);
+        let CombinedSnapshot { undo_snapshot, region_constraints_snapshot: _, universe: _ } =
+            snapshot;
 
         self.inner.borrow_mut().commit(undo_snapshot);
     }
@@ -1195,15 +1197,15 @@ impl<'tcx> InferCtxt<'tcx> {
             .var_origin(vid)
     }
 
-    /// Takes ownership of the list of variable regions. This implies
-    /// that all the region constraints have already been taken, and
-    /// hence that `resolve_regions_and_report_errors` can never be
-    /// called. This is used only during NLL processing to "hand off" ownership
-    /// of the set of region variables into the NLL region context.
+    /// Clone the list of variable regions. This is used only during NLL processing
+    /// to put the set of region variables into the NLL region context.
     pub fn get_region_var_origins(&self) -> VarInfos {
         let mut inner = self.inner.borrow_mut();
         let (var_infos, data) = inner
             .region_constraint_storage
+            // We clone instead of taking because borrowck still wants to use
+            // the inference context after calling this for diagnostics
+            // and the new trait solver.
             .clone()
             .expect("regions already resolved")
             .with_log(&mut inner.undo_log)
@@ -1457,6 +1459,7 @@ impl<'tcx> InferCtxt<'tcx> {
     /// universes. Updates `self.universe` to that new universe.
     pub fn create_next_universe(&self) -> ty::UniverseIndex {
         let u = self.universe.get().next_universe();
+        debug!("create_next_universe {u:?}");
         self.universe.set(u);
         u
     }
